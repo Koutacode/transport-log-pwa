@@ -15,18 +15,52 @@ import { watchPosition, clearWatch, haversineDistance, Coordinate } from './geo'
 import { loadConfig, parseNaturalLog, summarizeLogs } from './ai';
 
 // Application state for the current driving session
+// Additional interfaces to capture detailed event data. Breaks and rests
+// now store optional start/end coordinates so that the location of each
+// button press is preserved. Fuel logs capture where the vehicle was
+// refuelled. These structures make it easy to summarise events into
+// the final log note when the session ends.
+interface BreakLog {
+  start: number;
+  end?: number;
+  startLat?: number;
+  startLng?: number;
+  endLat?: number;
+  endLng?: number;
+}
+interface RestLog {
+  start: number;
+  end?: number;
+  startLat?: number;
+  startLng?: number;
+  endLat?: number;
+  endLng?: number;
+}
+interface FuelEvent {
+  time: number;
+  amount: number;
+  cost?: number;
+  lat: number;
+  lng: number;
+}
+
 interface SessionState {
   startTime: number;
   startCoord?: Coordinate;
   coords: Coordinate[];
   distance: number;
-  breaks: Array<{ start: number; end?: number }>;
-  fuelLogs: Array<{ time: number; amount: number; cost?: number }>;
+  breaks: BreakLog[];
+  rests: RestLog[];
+  fuelLogs: FuelEvent[];
   watchId?: number;
 }
 
 let currentSession: SessionState | null = null;
 let appConfig: { SHEETS_WEBAPP_URL?: string; OPENAI_API_KEY?: string } = {};
+
+// Interval ID for updating the timer display every second. When a session
+// is active the UI should refresh automatically so that seconds are shown.
+let timerIntervalId: number | undefined;
 
 /**
  * Entry point: load configuration and render the UI. We await
@@ -233,11 +267,11 @@ function renderActiveSession(): HTMLElement {
   const container = document.createElement('div');
   container.className = 'bg-white p-4 rounded shadow space-y-4';
   if (!currentSession) return container;
-  // Compute elapsed time and break time
+  // Compute elapsed time and break/rest time
   const now = Date.now();
-  const drivingMs = now - currentSession.startTime - totalBreakMs(currentSession);
-  const drivingMin = Math.floor(drivingMs / 60000);
-  const breakMin = Math.floor(totalBreakMs(currentSession) / 60000);
+  const breakMs = totalBreakMs(currentSession);
+  const restMs = totalRestMs(currentSession);
+  const drivingMs = now - currentSession.startTime - breakMs - restMs;
   // Header
   const header = document.createElement('h2');
   header.className = 'text-lg font-semibold';
@@ -247,7 +281,7 @@ function renderActiveSession(): HTMLElement {
   const stats = document.createElement('div');
   stats.className = 'space-y-1 text-sm';
   stats.innerHTML = `
-    <div>経過時間：<strong>${formatMinutes(drivingMin)}</strong> (運転), <strong>${formatMinutes(breakMin)}</strong> (休憩)</div>
+    <div>経過時間：<strong>${formatDuration(drivingMs)}</strong> (運転), <strong>${formatDuration(breakMs)}</strong> (休憩), <strong>${formatDuration(restMs)}</strong> (休息)</div>
     <div>走行距離：<strong>${currentSession.distance.toFixed(2)} km</strong></div>
     <div>燃料記録：${currentSession.fuelLogs.length}回</div>
   `;
@@ -259,6 +293,14 @@ function renderActiveSession(): HTMLElement {
   breakButton.textContent = onBreak ? '休憩終了' : '休憩開始';
   breakButton.onclick = toggleBreak;
   container.appendChild(breakButton);
+
+  // Rest button
+  const restButton = document.createElement('button');
+  const onRest = currentSession.rests.length > 0 && currentSession.rests[currentSession.rests.length - 1].end === undefined;
+  restButton.className = 'w-full py-3 rounded text-white ' + (onRest ? 'bg-yellow-800' : 'bg-blue-700');
+  restButton.textContent = onRest ? '休息終了' : '休息開始';
+  restButton.onclick = toggleRest;
+  container.appendChild(restButton);
   // Fuel button
   const fuelButton = document.createElement('button');
   fuelButton.className = 'w-full py-3 rounded bg-green-600 text-white';
@@ -291,12 +333,19 @@ async function startSession() {
         coords: [coord],
         distance: 0,
         breaks: [],
+        rests: [],
         fuelLogs: [],
         watchId: undefined
       };
       // Start watching for location updates
       const watchId = watchPosition(handleLocationUpdate, () => {});
       currentSession.watchId = watchId;
+      // Start periodic UI updates so that timers include seconds
+      timerIntervalId = window.setInterval(() => {
+        if (currentSession) {
+          render();
+        }
+      }, 1000);
       render();
     },
     err => {
@@ -331,13 +380,39 @@ function toggleBreak() {
   if (!currentSession) return;
   const breaks = currentSession.breaks;
   if (breaks.length > 0 && breaks[breaks.length - 1].end === undefined) {
-    // End ongoing break
-    breaks[breaks.length - 1].end = Date.now();
+    // End ongoing break: record end time and location
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        breaks[breaks.length - 1].end = Date.now();
+        breaks[breaks.length - 1].endLat = pos.coords.latitude;
+        breaks[breaks.length - 1].endLng = pos.coords.longitude;
+        render();
+      },
+      () => {
+        // If location fails, still end the break
+        breaks[breaks.length - 1].end = Date.now();
+        render();
+      },
+      { enableHighAccuracy: true }
+    );
   } else {
-    // Start new break
-    breaks.push({ start: Date.now() });
+    // Start new break: record start time and location
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        breaks.push({
+          start: Date.now(),
+          startLat: pos.coords.latitude,
+          startLng: pos.coords.longitude
+        });
+        render();
+      },
+      () => {
+        breaks.push({ start: Date.now() });
+        render();
+      },
+      { enableHighAccuracy: true }
+    );
   }
-  render();
 }
 
 /**
@@ -358,8 +433,33 @@ function addFuel() {
     const c = parseFloat(costStr);
     if (!isNaN(c) && c > 0) cost = c;
   }
-  currentSession.fuelLogs.push({ time: Date.now(), amount, cost });
-  render();
+  // Capture the current location when logging a fuel event. If location
+  // is successfully obtained, store the coordinates; otherwise fall back
+  // to zero values so that the event is still recorded. After
+  // recording the fuel event the UI is re-rendered.
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      currentSession!.fuelLogs.push({
+        time: Date.now(),
+        amount,
+        cost,
+        lat: pos.coords.latitude,
+        lng: pos.coords.longitude
+      });
+      render();
+    },
+    () => {
+      currentSession!.fuelLogs.push({
+        time: Date.now(),
+        amount,
+        cost,
+        lat: 0,
+        lng: 0
+      });
+      render();
+    },
+    { enableHighAccuracy: true }
+  );
 }
 
 /**
@@ -382,7 +482,8 @@ async function endSession() {
       currentSession.coords.push(endCoord);
       const totalDistance = currentSession.distance;
       const totalBreak = totalBreakMs(currentSession);
-      const drivingMs = Date.now() - currentSession.startTime - totalBreak;
+      const totalRest = totalRestMs(currentSession);
+      const drivingMs = Date.now() - currentSession.startTime - totalBreak - totalRest;
       const record: LogRecord = {
         date: new Date(currentSession.startTime).toISOString().split('T')[0],
         departureName: '',
@@ -405,8 +506,39 @@ async function endSession() {
       if (dep !== null) record.departureName = dep;
       const arr = prompt('到着地名を入力してください：', '');
       if (arr !== null) record.arrivalName = arr;
-      const note = prompt('備考や休息詳細（任意）：', '');
-      if (note !== null) record.note = note;
+      const userNote = prompt('備考や休息詳細（任意）：', '');
+      if (userNote !== null) record.note = userNote;
+
+      // Summarise rest time and detailed event history into the note field.
+      const restMinutes = Math.floor(totalRest / 60000);
+      const notes: string[] = [];
+      if (restMinutes > 0) {
+        notes.push(`休息合計:${restMinutes}分`);
+      }
+      // Append details of each break with timestamps and coordinates
+      currentSession.breaks.forEach((brk, idx) => {
+        const sTime = new Date(brk.start).toISOString();
+        const eTime = brk.end ? new Date(brk.end).toISOString() : '';
+        const sCoord = brk.startLat !== undefined ? `(${brk.startLat.toFixed(5)},${(brk.startLng ?? 0).toFixed(5)})` : '';
+        const eCoord = brk.endLat !== undefined ? `(${brk.endLat.toFixed(5)},${(brk.endLng ?? 0).toFixed(5)})` : '';
+        notes.push(`休憩${idx + 1}:${sTime}${sCoord}-${eTime}${eCoord}`);
+      });
+      // Append details of each rest
+      currentSession.rests.forEach((rest, idx) => {
+        const sTime = new Date(rest.start).toISOString();
+        const eTime = rest.end ? new Date(rest.end).toISOString() : '';
+        const sCoord = rest.startLat !== undefined ? `(${rest.startLat.toFixed(5)},${(rest.startLng ?? 0).toFixed(5)})` : '';
+        const eCoord = rest.endLat !== undefined ? `(${rest.endLat.toFixed(5)},${(rest.endLng ?? 0).toFixed(5)})` : '';
+        notes.push(`休息${idx + 1}:${sTime}${sCoord}-${eTime}${eCoord}`);
+      });
+      // Append details of each fuel stop
+      currentSession.fuelLogs.forEach((fuel, idx) => {
+        const t = new Date(fuel.time).toISOString();
+        notes.push(`給油${idx + 1}:${t}(${fuel.lat.toFixed(5)},${fuel.lng.toFixed(5)}) ${fuel.amount}L ¥${fuel.cost ?? 0}`);
+      });
+      // Combine existing note (entered by user) with automatic notes
+      record.note = [record.note, ...notes].filter(Boolean).join(' | ');
+
       // Persist the log locally and queue for sync if offline
       await saveLog(record, !navigator.onLine);
       await sendPendingIfOnline();
@@ -429,6 +561,75 @@ function totalBreakMs(session: SessionState): number {
     const end = b.end || Date.now();
     return sum + (end - b.start);
   }, 0);
+}
+
+/**
+ * Compute the total rest time in milliseconds for a session.
+ */
+function totalRestMs(session: SessionState): number {
+  return session.rests.reduce((sum, r) => {
+    const end = r.end || Date.now();
+    return sum + (end - r.start);
+  }, 0);
+}
+
+/**
+ * Format a duration specified in milliseconds into a string with hours, minutes
+ * and seconds. This helper is used to display timers with second-level
+ * precision in the UI.
+ */
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  return `${h}時間${m}分${s}秒`;
+}
+
+/**
+ * Toggle rest: start a new rest if none is active, otherwise end the current
+ * rest period. Rest periods mirror breaks but record separate
+ * timestamps and coordinates. When starting or ending a rest the
+ * current GPS position is captured; on error the rest still
+ * starts/ends with no coordinates. The UI is re-rendered after
+ * each change.
+ */
+function toggleRest() {
+  if (!currentSession) return;
+  const rests = currentSession.rests;
+  if (rests.length > 0 && rests[rests.length - 1].end === undefined) {
+    // End ongoing rest
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        rests[rests.length - 1].end = Date.now();
+        rests[rests.length - 1].endLat = pos.coords.latitude;
+        rests[rests.length - 1].endLng = pos.coords.longitude;
+        render();
+      },
+      () => {
+        rests[rests.length - 1].end = Date.now();
+        render();
+      },
+      { enableHighAccuracy: true }
+    );
+  } else {
+    // Start new rest
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        rests.push({
+          start: Date.now(),
+          startLat: pos.coords.latitude,
+          startLng: pos.coords.longitude
+        });
+        render();
+      },
+      () => {
+        rests.push({ start: Date.now() });
+        render();
+      },
+      { enableHighAccuracy: true }
+    );
+  }
 }
 
 /**
