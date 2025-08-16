@@ -1,0 +1,11 @@
+/*
+ * Custom styles for the transport log PWA. Since Tailwind CSS is
+ * loaded via CDN in index.html, the bulk of styling comes from
+ * utility classes. You can add custom rules here for fine-tuned
+ * presentation or component-specific overrides.
+ */
+
+/* Example: style the offline banner */
+#offline-banner {
+  transition: transform 0.3s ease;
+}
