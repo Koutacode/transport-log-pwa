@@ -63,6 +63,52 @@ let appConfig: { SHEETS_WEBAPP_URL?: string; OPENAI_API_KEY?: string } = {};
 let timerIntervalId: number | undefined;
 
 /**
+ * Prompt user for manual coordinates when geolocation fails.
+ * If the user cancels the prompt or inputs invalid values, the prompt will repeat.
+ */
+function promptForCoords(message: string = '現在位置を取得できませんでした。緯度と経度をカンマ区切りで入力してください（例: 43.06,141.35）'): { lat: number; lng: number } {
+  const input = prompt(message, '');
+  if (!input) {
+    throw new Error('緯度・経度の入力がキャンセルされました');
+  }
+  const parts = input.split(',');
+  if (parts.length !== 2) {
+    alert('緯度と経度をカンマ区切りで入力してください');
+    return promptForCoords(message);
+  }
+  const lat = parseFloat(parts[0].trim());
+  const lng = parseFloat(parts[1].trim());
+  if (isNaN(lat) || isNaN(lng)) {
+    alert('緯度または経度が正しくありません');
+    return promptForCoords(message);
+  }
+  return { lat, lng };
+}
+
+/**
+ * Helper to obtain current position or fall back to manual input.
+ * Returns a promise that resolves with a latitude/longitude pair.
+ */
+async function getCurrentPositionOrPrompt(): Promise<{ lat: number; lng: number }> {
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+      },
+      () => {
+        try {
+          const coords = promptForCoords();
+          resolve(coords);
+        } catch (e: any) {
+          reject(e);
+        }
+      },
+      { enableHighAccuracy: true }
+    );
+  });
+}
+
+/**
  * Entry point: load configuration and render the UI. We await
  * configuration as early as possible so that dependent features (e.g.
  * AI) know whether to show or hide their UI. After loading config
@@ -150,7 +196,7 @@ async function renderDashboard(): Promise<HTMLElement> {
       const li = document.createElement('li');
       li.className = 'py-2 flex justify-between items-center';
       const infoSpan = document.createElement('span');
-      infoSpan.innerHTML = `<strong>${log.date}</strong>：${log.departureName || '未設定'}→${log.arrivalName || '未設定'} / 距離 ${log.distanceKm.toFixed(1)}km`;
+      infoSpan.innerHTML = ` ${log.date} ：${log.departureName || '未設定'}→${log.arrivalName || '未設定'} / 距離 ${log.distanceKm.toFixed(1)}km`;
       li.appendChild(infoSpan);
       // Delete button for each log
       const delBtn = document.createElement('button');
@@ -173,7 +219,11 @@ async function renderDashboard(): Promise<HTMLElement> {
     syncBtn.textContent = 'スプレッドシートに同期';
     syncBtn.onclick = async () => {
       await sendPendingIfOnline();
-      alert('未送信のログを同期しました。');
+      if (!appConfig.SHEETS_WEBAPP_URL) {
+        alert('同期先のURLが設定されていません。config.jsonにSHEETS_WEBAPP_URLを指定してください。');
+      } else {
+        alert('未送信のログを同期しました。');
+      }
       await render();
     };
     historySection.appendChild(syncBtn);
@@ -305,9 +355,9 @@ function renderActiveSession(): HTMLElement {
   const stats = document.createElement('div');
   stats.className = 'space-y-1 text-sm';
   stats.innerHTML = `
-    <div>経過時間：<strong>${formatDuration(drivingMs)}</strong> (運転), <strong>${formatDuration(breakMs)}</strong> (休憩), <strong>${formatDuration(restMs)}</strong> (休息)</div>
-    <div>走行距離：<strong>${currentSession.distance.toFixed(2)} km</strong></div>
-    <div>燃料記録：${currentSession.fuelLogs.length}回</div>
+ 経過時間： ${formatDuration(drivingMs)} (運転), ${formatDuration(breakMs)} (休憩), ${formatDuration(restMs)} (休息) 
+ 走行距離： ${currentSession.distance.toFixed(2)} km 
+ 燃料記録：${currentSession.fuelLogs.length}回 
   `;
   container.appendChild(stats);
   // Break button
@@ -367,7 +417,7 @@ function renderActiveSession(): HTMLElement {
     const t = new Date(fuel.time).toLocaleTimeString();
     eventLines.push(`給油${idx + 1}: ${t} (${fuel.lat.toFixed(5)},${fuel.lng.toFixed(5)}) ${fuel.amount}L ¥${fuel.cost ?? 0}`);
   });
-  eventsContainer.innerHTML = eventLines.map(l => `<div>${l}</div>`).join('');
+  eventsContainer.innerHTML = eventLines.map(l => ` ${l} `).join('');
   container.appendChild(eventsContainer);
   return container;
 }
@@ -375,40 +425,37 @@ function renderActiveSession(): HTMLElement {
 /**
  * Start a new driving session. This obtains the initial location,
  * records the start time, and begins watching the user's location.
+ * On geolocation failure, the user is prompted to enter coordinates
+ * manually so that a session can still be started.
  */
 async function startSession() {
   if (currentSession) return;
-  // Request current position to initialise
-  navigator.geolocation.getCurrentPosition(
-    pos => {
-      const { latitude, longitude } = pos.coords;
-      const coord: Coordinate = { lat: latitude, lng: longitude, timestamp: pos.timestamp };
-      currentSession = {
-        startTime: Date.now(),
-        startCoord: coord,
-        coords: [coord],
-        distance: 0,
-        breaks: [],
-        rests: [],
-        fuelLogs: [],
-        watchId: undefined
-      };
-      // Start watching for location updates
-      const watchId = watchPosition(handleLocationUpdate, () => {});
-      currentSession.watchId = watchId;
-      // Start periodic UI updates so that timers include seconds
-      timerIntervalId = window.setInterval(() => {
-        if (currentSession) {
-          render();
-        }
-      }, 1000);
-      render();
-    },
-    err => {
-      alert('現在位置の取得に失敗しました: ' + err.message);
-    },
-    { enableHighAccuracy: true }
-  );
+  try {
+    const { lat, lng } = await getCurrentPositionOrPrompt();
+    const coord: Coordinate = { lat, lng, timestamp: Date.now() };
+    currentSession = {
+      startTime: Date.now(),
+      startCoord: coord,
+      coords: [coord],
+      distance: 0,
+      breaks: [],
+      rests: [],
+      fuelLogs: [],
+      watchId: undefined
+    };
+    // Start watching for location updates
+    const watchId = watchPosition(handleLocationUpdate, () => {});
+    currentSession.watchId = watchId;
+    // Start periodic UI updates so that timers include seconds
+    timerIntervalId = window.setInterval(() => {
+      if (currentSession) {
+        render();
+      }
+    }, 1000);
+    render();
+  } catch (err: any) {
+    alert('現在位置の取得に失敗しました: ' + err.message);
+  }
 }
 
 /**
@@ -431,50 +478,43 @@ function handleLocationUpdate(coord: Coordinate) {
 /**
  * Toggle break: start a new break if none is active, otherwise end
  * the current break. Breaks are recorded as start/end timestamps.
+ * If geolocation fails the user can input coordinates manually.
  */
-function toggleBreak() {
+async function toggleBreak() {
   if (!currentSession) return;
   const breaks = currentSession.breaks;
   if (breaks.length > 0 && breaks[breaks.length - 1].end === undefined) {
     // End ongoing break: record end time and location
-    navigator.geolocation.getCurrentPosition(
-      pos => {
-        breaks[breaks.length - 1].end = Date.now();
-        breaks[breaks.length - 1].endLat = pos.coords.latitude;
-        breaks[breaks.length - 1].endLng = pos.coords.longitude;
-        render();
-      },
-      () => {
-        // If location fails, still end the break
-        breaks[breaks.length - 1].end = Date.now();
-        render();
-      },
-      { enableHighAccuracy: true }
-    );
+    try {
+      const { lat, lng } = await getCurrentPositionOrPrompt();
+      breaks[breaks.length - 1].end = Date.now();
+      breaks[breaks.length - 1].endLat = lat;
+      breaks[breaks.length - 1].endLng = lng;
+    } catch {
+      // If location fails or cancelled, still end the break without coords
+      breaks[breaks.length - 1].end = Date.now();
+    }
   } else {
     // Start new break: record start time and location
-    navigator.geolocation.getCurrentPosition(
-      pos => {
-        breaks.push({
-          start: Date.now(),
-          startLat: pos.coords.latitude,
-          startLng: pos.coords.longitude
-        });
-        render();
-      },
-      () => {
-        breaks.push({ start: Date.now() });
-        render();
-      },
-      { enableHighAccuracy: true }
-    );
+    try {
+      const { lat, lng } = await getCurrentPositionOrPrompt();
+      breaks.push({
+        start: Date.now(),
+        startLat: lat,
+        startLng: lng
+      });
+    } catch {
+      breaks.push({ start: Date.now() });
+    }
   }
+  render();
 }
 
 /**
  * Prompt the user to enter fuel data and record it to the session.
+ * Location is captured via geolocation or manual input if geolocation fails.
  */
-function addFuel() {
+async function addFuel() {
   if (!currentSession) return;
   const amountStr = prompt('給油量 (リットル) を入力してください:', '0');
   if (!amountStr) return;
@@ -489,33 +529,25 @@ function addFuel() {
     const c = parseFloat(costStr);
     if (!isNaN(c) && c > 0) cost = c;
   }
-  // Capture the current location when logging a fuel event. If location
-  // is successfully obtained, store the coordinates; otherwise fall back
-  // to zero values so that the event is still recorded. After
-  // recording the fuel event the UI is re-rendered.
-  navigator.geolocation.getCurrentPosition(
-    pos => {
-      currentSession!.fuelLogs.push({
-        time: Date.now(),
-        amount,
-        cost,
-        lat: pos.coords.latitude,
-        lng: pos.coords.longitude
-      });
-      render();
-    },
-    () => {
-      currentSession!.fuelLogs.push({
-        time: Date.now(),
-        amount,
-        cost,
-        lat: 0,
-        lng: 0
-      });
-      render();
-    },
-    { enableHighAccuracy: true }
-  );
+  try {
+    const { lat, lng } = await getCurrentPositionOrPrompt();
+    currentSession!.fuelLogs.push({
+      time: Date.now(),
+      amount,
+      cost,
+      lat,
+      lng
+    });
+  } catch {
+    currentSession!.fuelLogs.push({
+      time: Date.now(),
+      amount,
+      cost,
+      lat: 0,
+      lng: 0
+    });
+  }
+  render();
 }
 
 /**
@@ -523,6 +555,7 @@ function addFuel() {
  * aggregated data, prompts the user to confirm the session
  * information, and persists the log. The log is queued for
  * synchronisation if the network is unavailable.
+ * Location is captured via geolocation or manual input if geolocation fails.
  */
 async function endSession() {
   if (!currentSession) return;
@@ -530,93 +563,95 @@ async function endSession() {
   if (currentSession.watchId !== undefined) {
     clearWatch(currentSession.watchId);
   }
-  // Get final position
-  navigator.geolocation.getCurrentPosition(
-    async pos => {
-      const { latitude, longitude } = pos.coords;
-      const endCoord: Coordinate = { lat: latitude, lng: longitude, timestamp: pos.timestamp };
-      currentSession.coords.push(endCoord);
-      const totalDistance = currentSession.distance;
-      const totalBreak = totalBreakMs(currentSession);
-      const totalRest = totalRestMs(currentSession);
-      const drivingMs = Date.now() - currentSession.startTime - totalBreak - totalRest;
-      const record: LogRecord = {
-        date: new Date(currentSession.startTime).toISOString().split('T')[0],
-        departureName: '',
-        arrivalName: '',
-        departureTime: new Date(currentSession.startTime).toISOString(),
-        arrivalTime: new Date().toISOString(),
-        drivingMinutes: Math.floor(drivingMs / 60000),
-        breakMinutes: Math.floor(totalBreak / 60000),
-        distanceKm: parseFloat(totalDistance.toFixed(3)),
-        fuelLitres: currentSession.fuelLogs.reduce((sum, f) => sum + f.amount, 0),
-        fuelCost: currentSession.fuelLogs.reduce((sum, f) => sum + (f.cost || 0), 0),
-        departureLat: currentSession.startCoord ? currentSession.startCoord.lat : 0,
-        departureLng: currentSession.startCoord ? currentSession.startCoord.lng : 0,
-        arrivalLat: endCoord.lat,
-        arrivalLng: endCoord.lng,
-        note: ''
-      };
-      // Automatically set departure and arrival names to Google Maps URLs using
-      // the recorded coordinates. This avoids requiring the user to enter
-      // these names manually. If the start coordinate is missing (unlikely),
-      // leave the field blank.
-      if (currentSession.startCoord) {
-        const startLat = currentSession.startCoord.lat;
-        const startLng = currentSession.startCoord.lng;
-        record.departureName = `https://www.google.com/maps?q=${startLat},${startLng}`;
-      }
-      record.arrivalName = `https://www.google.com/maps?q=${endCoord.lat},${endCoord.lng}`;
+  // Get final position (geolocation or manual)
+  let endLat = 0;
+  let endLng = 0;
+  let endTimestamp = Date.now();
+  try {
+    const { lat, lng } = await getCurrentPositionOrPrompt();
+    endLat = lat;
+    endLng = lng;
+    endTimestamp = Date.now();
+  } catch {
+    // If location fails, leave endLat/endLng as zero and timestamp already set
+  }
+  const endCoord: Coordinate = { lat: endLat, lng: endLng, timestamp: endTimestamp };
+  currentSession.coords.push(endCoord);
+  const totalDistance = currentSession.distance;
+  const totalBreak = totalBreakMs(currentSession);
+  const totalRest = totalRestMs(currentSession);
+  const drivingMs = Date.now() - currentSession.startTime - totalBreak - totalRest;
+  const record: LogRecord = {
+    date: new Date(currentSession.startTime).toISOString().split('T')[0],
+    departureName: '',
+    arrivalName: '',
+    departureTime: new Date(currentSession.startTime).toISOString(),
+    arrivalTime: new Date().toISOString(),
+    drivingMinutes: Math.floor(drivingMs / 60000),
+    breakMinutes: Math.floor(totalBreak / 60000),
+    distanceKm: parseFloat(totalDistance.toFixed(3)),
+    fuelLitres: currentSession.fuelLogs.reduce((sum, f) => sum + f.amount, 0),
+    fuelCost: currentSession.fuelLogs.reduce((sum, f) => sum + (f.cost || 0), 0),
+    departureLat: currentSession.startCoord ? currentSession.startCoord.lat : 0,
+    departureLng: currentSession.startCoord ? currentSession.startCoord.lng : 0,
+    arrivalLat: endCoord.lat,
+    arrivalLng: endCoord.lng,
+    note: ''
+  };
+  // Automatically set departure and arrival names to Google Maps URLs using
+  // the recorded coordinates. This avoids requiring the user to enter
+  // these names manually. If the start coordinate is missing (unlikely),
+  // leave the field blank.
+  if (currentSession.startCoord) {
+    const startLat = currentSession.startCoord.lat;
+    const startLng = currentSession.startCoord.lng;
+    record.departureName = `https://www.google.com/maps?q=${startLat},${startLng}`;
+  }
+  record.arrivalName = `https://www.google.com/maps?q=${endCoord.lat},${endCoord.lng}`;
 
-      // Prompt only for an optional user note (e.g. comments). If the user
-      // enters text, trim it and set it; otherwise leave note empty for now
-      const userNote = prompt('備考（任意）：', '');
-      if (userNote !== null && userNote.trim() !== '') {
-        record.note = userNote.trim();
-      }
+  // Prompt only for an optional user note (e.g. comments). If the user
+  // enters text, trim it and set it; otherwise leave note empty for now
+  const userNote = prompt('備考（任意）：', '');
+  if (userNote !== null && userNote.trim() !== '') {
+    record.note = userNote.trim();
+  }
 
-      // Summarise rest time and detailed event history into the note field.
-      const restMinutes = Math.floor(totalRest / 60000);
-      const notes: string[] = [];
-      if (restMinutes > 0) {
-        notes.push(`休息合計:${restMinutes}分`);
-      }
-      // Append details of each break with timestamps and coordinates
-      currentSession.breaks.forEach((brk, idx) => {
-        const sTime = new Date(brk.start).toISOString();
-        const eTime = brk.end ? new Date(brk.end).toISOString() : '';
-        const sCoord = brk.startLat !== undefined ? `(${brk.startLat.toFixed(5)},${(brk.startLng ?? 0).toFixed(5)})` : '';
-        const eCoord = brk.endLat !== undefined ? `(${brk.endLat.toFixed(5)},${(brk.endLng ?? 0).toFixed(5)})` : '';
-        notes.push(`休憩${idx + 1}:${sTime}${sCoord}-${eTime}${eCoord}`);
-      });
-      // Append details of each rest
-      currentSession.rests.forEach((rest, idx) => {
-        const sTime = new Date(rest.start).toISOString();
-        const eTime = rest.end ? new Date(rest.end).toISOString() : '';
-        const sCoord = rest.startLat !== undefined ? `(${rest.startLat.toFixed(5)},${(rest.startLng ?? 0).toFixed(5)})` : '';
-        const eCoord = rest.endLat !== undefined ? `(${rest.endLat.toFixed(5)},${(rest.endLng ?? 0).toFixed(5)})` : '';
-        notes.push(`休息${idx + 1}:${sTime}${sCoord}-${eTime}${eCoord}`);
-      });
-      // Append details of each fuel stop
-      currentSession.fuelLogs.forEach((fuel, idx) => {
-        const t = new Date(fuel.time).toISOString();
-        notes.push(`給油${idx + 1}:${t}(${fuel.lat.toFixed(5)},${fuel.lng.toFixed(5)}) ${fuel.amount}L ¥${fuel.cost ?? 0}`);
-      });
-      // Combine existing note (entered by user) with automatic notes
-      record.note = [record.note, ...notes].filter(Boolean).join(' | ');
+  // Summarise rest time and detailed event history into the note field.
+  const restMinutes = Math.floor(totalRest / 60000);
+  const notes: string[] = [];
+  if (restMinutes > 0) {
+    notes.push(`休息合計:${restMinutes}分`);
+  }
+  // Append details of each break with timestamps and coordinates
+  currentSession.breaks.forEach((brk, idx) => {
+    const sTime = new Date(brk.start).toISOString();
+    const eTime = brk.end ? new Date(brk.end).toISOString() : '';
+    const sCoord = brk.startLat !== undefined ? `(${brk.startLat.toFixed(5)},${(brk.startLng ?? 0).toFixed(5)})` : '';
+    const eCoord = brk.endLat !== undefined ? `(${brk.endLat.toFixed(5)},${(brk.endLng ?? 0).toFixed(5)})` : '';
+    notes.push(`休憩${idx + 1}:${sTime}${sCoord}-${eTime}${eCoord}`);
+  });
+  // Append details of each rest
+  currentSession.rests.forEach((rest, idx) => {
+    const sTime = new Date(rest.start).toISOString();
+    const eTime = rest.end ? new Date(rest.end).toISOString() : '';
+    const sCoord = rest.startLat !== undefined ? `(${rest.startLat.toFixed(5)},${(rest.startLng ?? 0).toFixed(5)})` : '';
+    const eCoord = rest.endLat !== undefined ? `(${rest.endLat.toFixed(5)},${(rest.endLng ?? 0).toFixed(5)})` : '';
+    notes.push(`休息${idx + 1}:${sTime}${sCoord}-${eTime}${eCoord}`);
+  });
+  // Append details of each fuel stop
+  currentSession.fuelLogs.forEach((fuel, idx) => {
+    const t = new Date(fuel.time).toISOString();
+    notes.push(`給油${idx + 1}:${t}(${fuel.lat.toFixed(5)},${fuel.lng.toFixed(5)}) ${fuel.amount}L ¥${fuel.cost ?? 0}`);
+  });
+  // Combine existing note (entered by user) with automatic notes
+  record.note = [record.note, ...notes].filter(Boolean).join(' | ');
 
-      // Persist the log locally and queue for sync if offline
-      await saveLog(record, !navigator.onLine);
-      await sendPendingIfOnline();
-      // Reset session state
-      currentSession = null;
-      render();
-    },
-    err => {
-      alert('終了位置の取得に失敗しました: ' + err.message);
-    },
-    { enableHighAccuracy: true }
-  );
+  // Persist the log locally and queue for sync if offline
+  await saveLog(record, !navigator.onLine);
+  await sendPendingIfOnline();
+  // Reset session state
+  currentSession = null;
+  render();
 }
 
 /**
@@ -656,46 +691,36 @@ function formatDuration(ms: number): string {
  * Toggle rest: start a new rest if none is active, otherwise end the current
  * rest period. Rest periods mirror breaks but record separate
  * timestamps and coordinates. When starting or ending a rest the
- * current GPS position is captured; on error the rest still
- * starts/ends with no coordinates. The UI is re-rendered after
- * each change.
+ * current GPS position is captured; on error the user can input
+ * coordinates manually.
  */
-function toggleRest() {
+async function toggleRest() {
   if (!currentSession) return;
   const rests = currentSession.rests;
   if (rests.length > 0 && rests[rests.length - 1].end === undefined) {
     // End ongoing rest
-    navigator.geolocation.getCurrentPosition(
-      pos => {
-        rests[rests.length - 1].end = Date.now();
-        rests[rests.length - 1].endLat = pos.coords.latitude;
-        rests[rests.length - 1].endLng = pos.coords.longitude;
-        render();
-      },
-      () => {
-        rests[rests.length - 1].end = Date.now();
-        render();
-      },
-      { enableHighAccuracy: true }
-    );
+    try {
+      const { lat, lng } = await getCurrentPositionOrPrompt();
+      rests[rests.length - 1].end = Date.now();
+      rests[rests.length - 1].endLat = lat;
+      rests[rests.length - 1].endLng = lng;
+    } catch {
+      rests[rests.length - 1].end = Date.now();
+    }
   } else {
     // Start new rest
-    navigator.geolocation.getCurrentPosition(
-      pos => {
-        rests.push({
-          start: Date.now(),
-          startLat: pos.coords.latitude,
-          startLng: pos.coords.longitude
-        });
-        render();
-      },
-      () => {
-        rests.push({ start: Date.now() });
-        render();
-      },
-      { enableHighAccuracy: true }
-    );
+    try {
+      const { lat, lng } = await getCurrentPositionOrPrompt();
+      rests.push({
+        start: Date.now(),
+        startLat: lat,
+        startLng: lng
+      });
+    } catch {
+      rests.push({ start: Date.now() });
+    }
   }
+  render();
 }
 
 /**
