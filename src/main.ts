@@ -10,7 +10,7 @@
  * network connectivity is available.
  */
 
-import { saveLog, getAllLogs, getPendingLogs, clearPendingLogs, LogRecord } from './db';
+import { saveLog, getAllLogs, getPendingLogs, clearPendingLogs, LogRecord, deleteLogById } from './db';
 import { watchPosition, clearWatch, haversineDistance, Coordinate } from './geo';
 import { loadConfig, parseNaturalLog, summarizeLogs } from './ai';
 
@@ -148,11 +148,35 @@ async function renderDashboard(): Promise<HTMLElement> {
     logs.sort((a, b) => (a.date < b.date ? 1 : -1));
     for (const log of logs) {
       const li = document.createElement('li');
-      li.className = 'py-2';
-      li.innerHTML = `<strong>${log.date}</strong>：${log.departureName || '未設定'}→${log.arrivalName || '未設定'} / 距離 ${log.distanceKm.toFixed(1)}km`;
+      li.className = 'py-2 flex justify-between items-center';
+      const infoSpan = document.createElement('span');
+      infoSpan.innerHTML = `<strong>${log.date}</strong>：${log.departureName || '未設定'}→${log.arrivalName || '未設定'} / 距離 ${log.distanceKm.toFixed(1)}km`;
+      li.appendChild(infoSpan);
+      // Delete button for each log
+      const delBtn = document.createElement('button');
+      delBtn.className = 'ml-2 px-2 py-1 bg-red-500 text-white rounded text-xs';
+      delBtn.textContent = '削除';
+      delBtn.onclick = async () => {
+        if (log.id === undefined) return;
+        if (confirm('このログを削除しますか？')) {
+          await deleteLogById(log.id);
+          await render();
+        }
+      };
+      li.appendChild(delBtn);
       ul.appendChild(li);
     }
     historySection.appendChild(ul);
+    // Add a button to manually synchronise pending logs to the sheet
+    const syncBtn = document.createElement('button');
+    syncBtn.className = 'mt-4 px-4 py-2 bg-indigo-600 text-white rounded';
+    syncBtn.textContent = 'スプレッドシートに同期';
+    syncBtn.onclick = async () => {
+      await sendPendingIfOnline();
+      alert('未送信のログを同期しました。');
+      await render();
+    };
+    historySection.appendChild(syncBtn);
   }
   container.appendChild(historySection);
 
@@ -313,6 +337,38 @@ function renderActiveSession(): HTMLElement {
   endButton.textContent = '走行終了';
   endButton.onclick = endSession;
   container.appendChild(endButton);
+
+  // Display a history of events (breaks, rests, fuel) with timestamps and
+  // coordinates so that the user can see where and when each action
+  // occurred. This list is scrollable to handle many entries. Each
+  // event is summarised with its type, index, timestamp and
+  // coordinates. Fuel events also include the amount and cost.
+  const eventsContainer = document.createElement('div');
+  eventsContainer.className = 'mt-4 max-h-40 overflow-y-auto border-t pt-2 text-xs space-y-1';
+  const eventLines: string[] = [];
+  // Breaks
+  currentSession.breaks.forEach((brk, idx) => {
+    const sTime = new Date(brk.start).toLocaleTimeString();
+    const eTime = brk.end ? new Date(brk.end).toLocaleTimeString() : '';
+    const sCoord = brk.startLat !== undefined ? `(${brk.startLat.toFixed(5)},${(brk.startLng ?? 0).toFixed(5)})` : '';
+    const eCoord = brk.endLat !== undefined ? `(${brk.endLat.toFixed(5)},${(brk.endLng ?? 0).toFixed(5)})` : '';
+    eventLines.push(`休憩${idx + 1}: ${sTime}${sCoord} - ${eTime}${eCoord}`);
+  });
+  // Rests
+  currentSession.rests.forEach((rest, idx) => {
+    const sTime = new Date(rest.start).toLocaleTimeString();
+    const eTime = rest.end ? new Date(rest.end).toLocaleTimeString() : '';
+    const sCoord = rest.startLat !== undefined ? `(${rest.startLat.toFixed(5)},${(rest.startLng ?? 0).toFixed(5)})` : '';
+    const eCoord = rest.endLat !== undefined ? `(${rest.endLat.toFixed(5)},${(rest.endLng ?? 0).toFixed(5)})` : '';
+    eventLines.push(`休息${idx + 1}: ${sTime}${sCoord} - ${eTime}${eCoord}`);
+  });
+  // Fuel events
+  currentSession.fuelLogs.forEach((fuel, idx) => {
+    const t = new Date(fuel.time).toLocaleTimeString();
+    eventLines.push(`給油${idx + 1}: ${t} (${fuel.lat.toFixed(5)},${fuel.lng.toFixed(5)}) ${fuel.amount}L ¥${fuel.cost ?? 0}`);
+  });
+  eventsContainer.innerHTML = eventLines.map(l => `<div>${l}</div>`).join('');
+  container.appendChild(eventsContainer);
   return container;
 }
 
@@ -501,13 +557,23 @@ async function endSession() {
         arrivalLng: endCoord.lng,
         note: ''
       };
-      // Allow the user to enter departure/arrival names and note
-      const dep = prompt('出発地名を入力してください：', '');
-      if (dep !== null) record.departureName = dep;
-      const arr = prompt('到着地名を入力してください：', '');
-      if (arr !== null) record.arrivalName = arr;
-      const userNote = prompt('備考や休息詳細（任意）：', '');
-      if (userNote !== null) record.note = userNote;
+      // Automatically set departure and arrival names to Google Maps URLs using
+      // the recorded coordinates. This avoids requiring the user to enter
+      // these names manually. If the start coordinate is missing (unlikely),
+      // leave the field blank.
+      if (currentSession.startCoord) {
+        const startLat = currentSession.startCoord.lat;
+        const startLng = currentSession.startCoord.lng;
+        record.departureName = `https://www.google.com/maps?q=${startLat},${startLng}`;
+      }
+      record.arrivalName = `https://www.google.com/maps?q=${endCoord.lat},${endCoord.lng}`;
+
+      // Prompt only for an optional user note (e.g. comments). If the user
+      // enters text, trim it and set it; otherwise leave note empty for now
+      const userNote = prompt('備考（任意）：', '');
+      if (userNote !== null && userNote.trim() !== '') {
+        record.note = userNote.trim();
+      }
 
       // Summarise rest time and detailed event history into the note field.
       const restMinutes = Math.floor(totalRest / 60000);

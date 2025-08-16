@@ -111,3 +111,21 @@ export async function clearPendingLogs(): Promise<void> {
     tx.onerror = () => reject(tx.error);
   });
 }
+
+/**
+ * Delete a log record by its ID from both the logs store and the pending
+ * store. When a user deletes a past log from the UI we remove it
+ * entirely from local storage. If the record was pending, removing
+ * it from the pending store prevents it from being sent later.
+ * @param id The auto-incremented ID of the log to delete
+ */
+export async function deleteLogById(id: number): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_LOGS, STORE_PENDING], 'readwrite');
+    tx.objectStore(STORE_LOGS).delete(id);
+    tx.objectStore(STORE_PENDING).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
