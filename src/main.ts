@@ -227,6 +227,16 @@ async function renderDashboard(): Promise<HTMLElement> {
       await render();
     };
     historySection.appendChild(syncBtn);
+    // Add a button to export all logs as CSV. This allows users to download their data
+    // without relying on external services like Google Sheets. The exported file can be
+    // opened in Excel or other spreadsheet applications.
+    const exportBtn = document.createElement('button');
+    exportBtn.className = 'mt-2 px-4 py-2 bg-green-600 text-white rounded';
+    exportBtn.textContent = 'CSVでエクスポート';
+    exportBtn.onclick = async () => {
+      await exportLogsToCSV();
+    };
+    historySection.appendChild(exportBtn);
   }
   container.appendChild(historySection);
 
@@ -780,6 +790,62 @@ async function postLog(record: LogRecord): Promise<void> {
   if (!body || !body.ok) {
     throw new Error('Server error: ' + JSON.stringify(body));
   }
+}
+
+/**
+ * Export all stored logs to a CSV file and trigger a download. This utility
+ * iterates over the local log records, constructs a CSV string with a
+ * header row, and uses a Blob to initiate a file download. Text fields
+ * are quoted and any double quotes are escaped to ensure correct CSV formatting.
+ * If no logs exist, the user is alerted.
+ */
+async function exportLogsToCSV(): Promise<void> {
+  const logs = await getAllLogs();
+  if (logs.length === 0) {
+    alert('エクスポートするログがありません。');
+    return;
+  }
+  // Define the columns to include in the CSV export. These keys should
+  // correspond to the LogRecord interface fields.
+  const headers = [
+    'date',
+    'departureName',
+    'arrivalName',
+    'departureTime',
+    'arrivalTime',
+    'drivingMinutes',
+    'breakMinutes',
+    'distanceKm',
+    'fuelLitres',
+    'fuelCost',
+    'departureLat',
+    'departureLng',
+    'arrivalLat',
+    'arrivalLng',
+    'note'
+  ];
+  const csvRows: string[] = [];
+  csvRows.push(headers.join(','));
+  for (const log of logs) {
+    const row = headers.map((key) => {
+      const value: any = (log as any)[key];
+      if (value === undefined || value === null) return '';
+      // Quote string values and escape double quotes
+      if (typeof value === 'string') {
+        return `"${value.replace(/"/g, '""')}"`;
+      }
+      return value.toString();
+    });
+    csvRows.push(row.join(','));
+  }
+  const csvContent = csvRows.join('\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `transport_logs_${new Date().toISOString().split('T')[0]}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // Kick off the application
